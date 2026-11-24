@@ -4,32 +4,32 @@ Tkinter Login + GitHub Image Uploader (static credentials, no database).
 Flow:
   1. Login screen (centered window, eye button to show/hide password)
   2. After correct login -> Upload page: paste a file path or browse for an
-     image / PDF, preview it, then click "Upload to GitHub".
-  3. The app logs in to GitHub with your Personal Access Token, creates the
-     repository if it doesn't exist yet, and uploads the file into it.
+     image, preview it, then click "Upload to GitHub".
+  3. The image is converted to a compressed 1280x800 PNG and uploaded to the
+     ROOT of your repository as img.png. If img.png already exists it is
+     replaced, so the repo always holds exactly one image.
+
+Requirements:
+    pip install pillow          (needed for the PNG conversion / resizing)
 
 GitHub setup (one time):
-  - GitHub > Settings > Developer settings > Personal access tokens >
-    Tokens (classic) > Generate new token, tick the "repo" scope.
-  - Set it as an environment variable named GITHUB_TOKEN
-        Windows (PowerShell):  setx GITHUB_TOKEN "ghp_xxxxxxxx"   (then reopen terminal)
-        Mac/Linux:             export GITHUB_TOKEN="ghp_xxxxxxxx"
-    OR create a file named .env next to this script containing:
+  - Create a Personal Access Token (classic: scope "repo", or fine-grained with
+    access to the repo and Contents: Read and write).
+  - Put it in a file named .env next to this script:
         GITHUB_TOKEN=ghp_xxxxxxxx
     (add .env to .gitignore so it is never committed or shared).
-  - Choose the repository name in GITHUB_REPO below.
+  - Set the repository name in GITHUB_REPO below.
 
 Run:  python login_app.py      (default login: admin / Admin@123)
-
-Optional (for image previews of JPG/WEBP/BMP etc.):  pip install pillow
 """
 
 import base64
 import hmac
+import io
 import json
 import os
 import queue
-import re
+import ssl
 import threading
 import time
 import tkinter as tk
@@ -37,19 +37,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 try:
-    from PIL import Image, ImageTk  # optional
+    from PIL import Image, ImageOps, ImageTk  # Pillow
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
 
 # ---------------------------------------------------------------- .env support
 def load_env_file(filename: str = ".env"):
-    """Read KEY=VALUE lines from a .env file next to this script (if present)
-    and add them to the environment. Real environment variables win."""
+    """Read KEY=VALUE lines from a .env file next to this script (if present).
+    Values in .env override any existing environment variable of the same name."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
     if not os.path.isfile(path):
         return
@@ -59,7 +58,7 @@ def load_env_file(filename: str = ".env"):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+            os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
 load_env_file()
@@ -72,15 +71,19 @@ USERS = {
 
 # ---- GitHub settings ----
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")   # or paste: "ghp_xxxxxxxx"
-GITHUB_REPO = "image-uploads"    # repository name (created automatically if missing)
+GITHUB_REPO = "image_scheduler"    # repository name (created automatically if missing)
 GITHUB_PRIVATE = True            # True = private repo, False = public (used only when creating)
-GITHUB_FOLDER = "uploads"        # folder inside the repo ("" = repo root)
+GITHUB_FOLDER = ""               # "" = upload directly into the repo root
+GITHUB_FILENAME = "img.png"      # every upload is saved under this name
+TARGET_SIZE = (1280, 800)        # output resolution (width, height)
+RESIZE_MODE = "fit"             # "crop" = fill 1280x800, trimming edges if needed
+                                 # "fit"  = whole image visible, white/transparent bars
+                                 # "stretch" = force 1280x800 (may distort)
 MAX_UPLOAD_MB = 25               # GitHub's contents API works best below this size
 GITHUB_API = "https://api.github.com"
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-PDF_EXTS = {".pdf"}
-ALLOWED_EXTS = IMAGE_EXTS | PDF_EXTS
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".pdf"}
+ALLOWED_EXTS = IMAGE_EXTS
 
 # colours
 BG = "#eef1f6"
@@ -131,8 +134,68 @@ def human_size(num_bytes: int) -> str:
     return f"{size:.1f} TB"
 
 
+def prepare_png(path: str) -> bytes:
+    """Open any supported image, resize to TARGET_SIZE and return compressed PNG bytes."""
+    if not PIL_AVAILABLE:
+        raise GitHubError("Pillow is required for PNG conversion. Run:  pip install pillow")
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)  # respect phone-photo rotation
+            has_alpha = img.mode in ("RGBA", "LA") or (
+                img.mode == "P" and "transparency" in img.info
+            )
+            img = img.convert("RGBA" if has_alpha else "RGB")
+
+            width, height = TARGET_SIZE
+            if RESIZE_MODE == "crop":
+                img = ImageOps.fit(img, TARGET_SIZE, Image.LANCZOS)
+            elif RESIZE_MODE == "fit":
+                img = ImageOps.contain(img, TARGET_SIZE, Image.LANCZOS)
+                background = Image.new(
+                    img.mode, TARGET_SIZE, (255, 255, 255, 0) if has_alpha else (255, 255, 255)
+                )
+                background.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
+                img = background
+            else:
+                img = img.resize(TARGET_SIZE, Image.LANCZOS)
+
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG", optimize=True, compress_level=9)
+            return buffer.getvalue()
+    except GitHubError:
+        raise
+    except Exception as exc:
+        raise GitHubError(f"Could not read or convert the image: {exc}")
+
+
 class GitHubError(Exception):
     """Readable error message to show to the user."""
+
+
+def ssl_contexts():
+    """Certificate sources to try, in order. 'truststore' (pip install truststore)
+    makes Python trust the same certificates as your operating system, which fixes
+    most antivirus / office-network HTTPS problems."""
+    contexts = []
+    try:
+        import truststore  # optional
+        contexts.append(truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    except Exception:
+        pass
+    contexts.append(ssl.create_default_context())
+    try:
+        import certifi  # optional
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+    return contexts
+
+
+def with_headers(body, headers):
+    """Attach the response headers (lower-cased) to the body under '_headers'."""
+    if isinstance(body, dict):
+        body["_headers"] = {k.lower(): v for k, v in headers.items()}
+    return body
 
 
 def github_request(method: str, url: str, token: str, payload=None):
@@ -145,17 +208,39 @@ def github_request(method: str, url: str, token: str, payload=None):
     req.add_header("User-Agent", "tkinter-uploader")
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = resp.read().decode("utf-8")
-            return resp.status, (json.loads(body) if body else {})
-    except urllib.error.HTTPError as exc:
+
+    ssl_problem = None
+    for context in ssl_contexts():
         try:
-            return exc.code, json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            return exc.code, {}
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise GitHubError("Could not reach GitHub. Check your internet connection.")
+            with urllib.request.urlopen(req, timeout=60, context=context) as resp:
+                body = resp.read().decode("utf-8")
+                return resp.status, with_headers(json.loads(body) if body else {}, resp.headers)
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, with_headers(json.loads(exc.read().decode("utf-8")), exc.headers)
+            except Exception:
+                return exc.code, with_headers({}, exc.headers)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, ssl.SSLError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
+                ssl_problem = reason
+                continue  # try the next certificate source
+            raise GitHubError(
+                f"Could not connect to GitHub: {reason}. Check your internet, "
+                "proxy/VPN or firewall settings."
+            )
+        except ssl.SSLError as exc:
+            ssl_problem = exc
+            continue
+        except (TimeoutError, OSError) as exc:
+            raise GitHubError(f"Could not connect to GitHub: {exc}")
+
+    raise GitHubError(
+        "Could not connect to GitHub: SSL certificate problem "
+        f"({ssl_problem}). Fix: run  pip install truststore  and restart the app. "
+        "Also check that your PC date/time is correct, and that no VPN, antivirus "
+        "HTTPS scanning or office/school firewall is intercepting the connection."
+    )
 
 
 def github_upload(file_path: str, progress) -> dict:
@@ -179,9 +264,14 @@ def github_upload(file_path: str, progress) -> dict:
     if status != 200:
         raise GitHubError(f"GitHub login failed ({status}): {user.get('message', '')}")
     owner = user["login"]
+    token_kind = (
+        "fine-grained" if token.startswith("github_pat_")
+        else "classic" if token.startswith("ghp_") else "unknown type"
+    )
+    token_id = f"{token_kind} token ending …{token[-4:]}"
 
     # 2) make sure the repository exists
-    progress(f"Logged in as {owner}. Checking repository…")
+    progress(f"Logged in as {owner} ({token_id}). Checking repository…")
     status, repo = github_request("GET", f"{GITHUB_API}/repos/{owner}/{GITHUB_REPO}", token)
     if status == 404:
         progress("Repository not found. Creating it…")
@@ -203,26 +293,49 @@ def github_upload(file_path: str, progress) -> dict:
         raise GitHubError(f"Could not open the repository ({status}): {repo.get('message', '')}")
     branch = repo.get("default_branch", "main")
 
-    # 3) upload the file (unique name so nothing is overwritten)
-    progress("Uploading file…")
-    with open(file_path, "rb") as f:
-        content = base64.b64encode(f.read()).decode("ascii")
+    # 3) convert to a compressed 1280x800 PNG
+    progress(f"Converting to PNG ({TARGET_SIZE[0]}×{TARGET_SIZE[1]})…")
+    content = base64.b64encode(prepare_png(file_path)).decode("ascii")
 
-    stem, ext = os.path.splitext(os.path.basename(file_path))
-    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_") or "file"
-    name = f"{safe_stem}_{datetime.now():%Y%m%d_%H%M%S}{ext.lower()}"
+    # 4) upload as img.png, replacing the old one if it exists
     folder = GITHUB_FOLDER.strip("/")
-    repo_path = f"{folder}/{name}" if folder else name
-
-    status, result = github_request(
-        "PUT",
-        f"{GITHUB_API}/repos/{owner}/{GITHUB_REPO}/contents/{urllib.parse.quote(repo_path)}",
-        token,
-        {"message": f"Upload {name}", "content": content, "branch": branch},
+    repo_path = f"{folder}/{GITHUB_FILENAME}" if folder else GITHUB_FILENAME
+    file_url = (
+        f"{GITHUB_API}/repos/{owner}/{GITHUB_REPO}/contents/{urllib.parse.quote(repo_path)}"
     )
+
+    progress(f"Uploading {GITHUB_FILENAME}…")
+    status, existing = github_request(
+        "GET", f"{file_url}?ref={urllib.parse.quote(branch)}", token
+    )
+    payload = {"message": f"Add {GITHUB_FILENAME}", "content": content, "branch": branch}
+    if status == 200 and existing.get("sha"):
+        payload["sha"] = existing["sha"]  # required by GitHub to overwrite a file
+        payload["message"] = f"Replace {GITHUB_FILENAME}"
+    elif status == 404:
+        if "empty" in str(existing.get("message", "")).lower():
+            payload.pop("branch")  # brand-new empty repo: no branch exists yet
+    else:
+        raise GitHubError(
+            f"Could not check for the existing image ({status}): {existing.get('message', '')}"
+        )
+
+    status, result = github_request("PUT", file_url, token, payload)
     if status not in (200, 201):
-        hint = " (check that your token has the 'repo' scope)" if status in (403, 404) else ""
-        raise GitHubError(f"Upload failed ({status}): {result.get('message', '')}{hint}")
+        headers = result.get("_headers", {})
+        lines = [f"Upload failed ({status}): {result.get('message', '')}"]
+        lines.append(f"Target: {owner}/{GITHUB_REPO}, branch '{branch}'")
+        lines.append(f"Using: {token_id}")
+        needed = headers.get("x-accepted-github-permissions")
+        if needed:
+            lines.append(f"GitHub says this action needs: {needed}")
+        if token_kind == "classic":
+            scopes = user.get("_headers", {}).get("x-oauth-scopes", "")
+            lines.append(f"Token scopes: {scopes or 'none'} (needs 'repo')")
+        elif status in (403, 404):
+            lines.append("Fine-grained token: needs access to this repo AND "
+                         "Repository permissions > Contents: Read and write.")
+        raise GitHubError("\n".join(lines))
 
     return {
         "owner": owner,
@@ -430,7 +543,7 @@ class App:
         ttk.Button(header, text="Logout", style="Logout.TButton",
                    command=self.show_login, cursor="hand2").pack(side="right")
 
-        ttk.Label(card, text="Upload an image or PDF to GitHub", style="Sub.TLabel").pack(
+        ttk.Label(card, text="Upload an image to GitHub", style="Sub.TLabel").pack(
             anchor="w", pady=(2, 18))
 
         # path + browse
@@ -449,7 +562,7 @@ class App:
 
         ttk.Label(
             card, style="Sub.TLabel",
-            text="Paste a path or click Browse. Supported: JPG, PNG, GIF, BMP, WEBP, PDF",
+            text="Paste a path or click Browse. Saved as a 1280×800 PNG named img.png",
         ).pack(anchor="w", pady=(0, 14))
 
         # preview box
@@ -478,11 +591,9 @@ class App:
 
     def browse_file(self):
         path = filedialog.askopenfilename(
-            title="Select an image or PDF",
+            title="Select an image",
             filetypes=[
-                ("Images and PDF", "*.jpg *.jpeg *.png *.gif *.bmp *.webp *.pdf"),
-                ("Images", "*.jpg *.jpeg *.png *.gif *.bmp *.webp"),
-                ("PDF files", "*.pdf"),
+                ("Images", "*.jpg *.jpeg *.png *.gif *.bmp *.webp *.tif *.tiff"),
             ],
         )
         if path:
@@ -509,13 +620,15 @@ class App:
         if ext not in ALLOWED_EXTS:
             self.reset_preview("Unsupported file type")
             if not quiet:
-                self.show_error("Only image files and PDFs are allowed.")
+                self.show_error("Only image files are allowed (JPG, PNG, GIF, BMP, WEBP, TIFF).")
             return False
 
         self.path_var.set(path)
         self.selected_file = path
         size = human_size(os.path.getsize(path))
-        self.info_label.config(text=f"{os.path.basename(path)}  •  {size}  •  {ext[1:].upper()}")
+        self.info_label.config(
+            text=f"{os.path.basename(path)}  •  {size}  •  {ext[1:].upper()}  →  uploads as {GITHUB_FILENAME}"
+        )
         self.show_preview(path, ext)
         return True
 
@@ -531,12 +644,6 @@ class App:
         self.info_label.config(text="")
 
     def show_preview(self, path: str, ext: str):
-        if ext in PDF_EXTS:
-            self.preview_image = None
-            self.preview_label.config(image="", text="📄\nPDF document selected",
-                                      font=("Segoe UI", 13))
-            return
-
         image = None
         try:
             if PIL_AVAILABLE:
@@ -615,7 +722,9 @@ class App:
 
     def on_upload_error(self, message: str):
         self.upload_btn.config(state="normal", text="Upload to GitHub")
-        self.show_error(message)
+        self.show_error(message.split("\n")[0])
+        if "\n" in message:
+            messagebox.showerror("Upload failed - details", message)
 
 
 if __name__ == "__main__":
